@@ -101,9 +101,10 @@ pub trait MeshTransport: Send {
     }
 }
 
+/// 32-byte companion field is NUL-terminated then padded; only bytes before the first `0` are the name.
 fn normalize_channel_name(raw: &[u8]) -> String {
-    String::from_utf8_lossy(raw)
-        .trim_end_matches('\0')
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end])
         .trim()
         .to_string()
 }
@@ -413,8 +414,10 @@ fn log_received_packets(frames: &[Vec<u8>]) {
             .map(|b| format!("{b:02x}"))
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!("rx packet {} bytes: {hex}", frame.len());
-        eprintln!("  parsed: {}", format_parsed_packet(frame, PacketDirection::Rx));
+        if log_all {
+            eprintln!("rx packet {} bytes: {hex}", frame.len());
+        }
+        eprintln!("  rx: {}", format_parsed_packet(frame, PacketDirection::Rx));
     }
 }
 
@@ -428,7 +431,7 @@ fn log_outgoing_payload(payload: &[u8]) {
         .collect::<Vec<_>>()
         .join(" ");
     eprintln!("tx packet {} bytes: {hex}", payload.len());
-    eprintln!("  parsed: {}", format_parsed_packet(payload, PacketDirection::Tx));
+    eprintln!("  tx: {}", format_parsed_packet(payload, PacketDirection::Tx));
 }
 
 fn get_channel_cmd(idx: u8) -> Vec<u8> {
