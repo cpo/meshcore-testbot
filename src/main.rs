@@ -47,7 +47,7 @@ const PKT_NO_MORE_MSGS: u8 = 0x0a;
 
 const MONITORED_HASHTAGS: &[&str] = &["#bot", "#bots", "#test", "ZeewoldeDenBosch"];
 const MAX_CHANNEL_TEXT_BYTES: usize = 133;
-const TRIGGER_TEXT: &str = "Test";
+const TRIGGER_TEXTS: &[&str] = &["test", "ontvang", "ping", "echo"];
 const DEFAULT_REPLY_TEXT: &str = "Den Bosch Noord";
 
 static REPLY_TEXT: OnceLock<String> = OnceLock::new();
@@ -144,9 +144,12 @@ fn author_name_from_channel_text(text: &str) -> Option<&str> {
     }
 }
 
-/// Body must be exactly `Test` (ASCII case-insensitive): either the whole trimmed text or the part after `name: `. Signed messages strip the 4-byte pubkey prefix in the parser first.
+/// Body must match one configured trigger exactly (ASCII case-insensitive): either the whole trimmed text or the part after `name: `. Signed messages strip the 4-byte pubkey prefix in the parser first.
 fn message_is_exactly_test(text: &str) -> bool {
-    channel_message_body_for_trigger(text).eq_ignore_ascii_case(TRIGGER_TEXT)
+    let body = channel_message_body_for_trigger(text);
+    TRIGGER_TEXTS
+        .iter()
+        .any(|trigger| body.eq_ignore_ascii_case(trigger))
 }
 
 fn looks_like_our_reply(text: &str) -> bool {
@@ -881,7 +884,8 @@ async fn main() -> Result<()> {
         run_bot_inner(
             &mut tcp,
             &format!(
-                "TCP {addr} — trigger: exact message \"{TRIGGER_TEXT}\""
+                "TCP {addr} — trigger: exact message in {:?}",
+                TRIGGER_TEXTS
             ),
         )
         .await
@@ -899,7 +903,8 @@ async fn main() -> Result<()> {
         run_bot_inner(
             &mut serial,
             &format!(
-                "USB serial {path} @ {baud} baud — trigger: exact message \"{TRIGGER_TEXT}\""
+                "USB serial {path} @ {baud} baud — trigger: exact message in {:?}",
+                TRIGGER_TEXTS
             ),
         )
         .await
