@@ -764,7 +764,7 @@ async fn handle_incoming_frame<T: MeshTransport + ?Sized>(
             let hops = hops_label(&msg.path);
             let loc = reply_location_text();
             let reply = match author_name_from_channel_text(&msg.text) {
-                Some(author) => clamp_meshcore_utf8(format!("@[{author}]: {loc} — {hops}")),
+                Some(author) => clamp_meshcore_utf8(format!("@[{author}]: {loc} —> {hops}")),
                 None => clamp_meshcore_utf8(format!("{loc} — {hops}")),
             };
             eprintln!("reply on ch {}: {reply}", msg.channel_idx);
