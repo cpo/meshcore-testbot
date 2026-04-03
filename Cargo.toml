@@ -1,0 +1,12 @@
+[package]
+name = "meshcorebot"
+version = "0.1.0"
+edition = "2021"
+description = "MeshCore companion bot over USB serial or TCP"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serialport = "4"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
