@@ -17,7 +17,7 @@ It also runs an embedded **visor**: an HTTP server with a **Vue** frontend and *
 - Periodic `GET_MESSAGE` polling (configurable).
 - Optional verbose logging of all companion packets (`MESHCORE_LOGALL`).
 - Replies to trigger words on the same channel (e.g. `Test`, `ping`, `echo`, `ontvang`; see code).
-- Optional: visor only, no bot logic (`MESHCORE_BOT_DISABLED`).
+- Channel triggers/replies only when `MESHCORE_BOT_ENABLED` is set (non-empty); default is visor-only (no bot logic).
 
 ### Visor (map & routes)
 
@@ -114,7 +114,7 @@ Vite proxies `/ws` to the visor on `127.0.0.1` — port via **`VITE_VISOR_PORT`*
 | `MESHCORE_POLL_SECS` | `GET_MESSAGE` polling interval in seconds (default `3`). |
 | `MESHCORE_LOGALL` | Non-empty: log all companion packets in/out (stderr). |
 | `MESHCORE_REPLY_TEXT` | Location line in replies (default `Den Bosch Noord`). |
-| `MESHCORE_BOT_DISABLED` | Non-empty: disable channel triggers/replies; visor keeps running. |
+| `MESHCORE_BOT_ENABLED` | Non-empty: enable channel triggers/replies. If unset or empty, bot logic is off; visor keeps running. |
 
 ### Visor & static frontend
 

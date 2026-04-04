@@ -7,6 +7,7 @@
 //! Optional for both: `MESHCORE_POLL_SECS` (default `3`) for periodic `GET_MESSAGE` polling.
 //! Set `MESHCORE_LOGALL` (any non-empty value) to log every companion packet **in and out** (hex dump and parsed summary on stderr).
 //! Channel message packets (`0x08` / `0x11`) are always printed on receive (same format), even when `MESHCORE_LOGALL` is unset.
+//! Set `MESHCORE_BOT_ENABLED` (non-empty) to send trigger replies on channels; if unset, the visor still runs but auto-replies are off.
 //!
 //! **Route visualizer:** `MESHCORE_VISOR_PORT` (default `3847`) starts an HTTP server + WebSocket (`/ws`) and serves the Vue
 //! build from `frontend/dist` (override with `MESHCORE_FRONTEND_DIST`). Contacten worden opgehaald van de MeshCore-kaart-API
@@ -61,7 +62,7 @@ const PKT_NO_MORE_MSGS: u8 = 0x0a;
 const MONITORED_HASHTAGS: &[&str] = &["#bot", "#bots", "#test", "ZeewoldeDenBosch"];
 const MAX_CHANNEL_TEXT_BYTES: usize = 133;
 const TRIGGER_TEXTS: &[&str] = &["test", "ontvang", "ping", "echo"];
-const DEFAULT_REPLY_TEXT: &str = "Den Bosch Noord";
+const DEFAULT_REPLY_TEXT: &str = "Set DEFAULT_REPLY_TEXT please";
 
 static REPLY_TEXT: OnceLock<String> = OnceLock::new();
 
@@ -114,8 +115,9 @@ pub trait MeshTransport: Send {
     }
 }
 
-fn is_bot_disabled() -> bool {
-    env::var("MESHCORE_BOT_DISABLED")
+/// Channel reply/trigger logic runs only when set to a non-empty value (default: off; visor always runs).
+fn is_bot_enabled() -> bool {
+    env::var("MESHCORE_BOT_ENABLED")
         .ok()
         .is_some_and(|s| !s.trim().is_empty())
 }
@@ -793,7 +795,7 @@ async fn handle_incoming_frame<T: MeshTransport + ?Sized>(
             let Some(msg) = parse_channel_message(frame) else {
                 return Ok(());
             };
-            if is_bot_disabled() {
+            if !is_bot_enabled() {
                 return Ok(());
             }
             if monitored.is_empty() || !monitored.contains(&msg.channel_idx) {
