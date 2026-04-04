@@ -55,6 +55,23 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
+/** Route-`id` van de server is meestal ms sinds epoch; toon als UTC ISO. */
+function routeIdUtc(id) {
+  const raw = id == null ? "" : String(id).trim();
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    return raw;
+  }
+  const d = new Date(n);
+  if (Number.isNaN(d.getTime())) {
+    return raw;
+  }
+  if (n < 1e11 || n > 1e14) {
+    return raw;
+  }
+  return d.toISOString();
+}
+
 function wsUrl() {
   const explicit = import.meta.env.VITE_VISOR_WS_URL;
   if (explicit) {
@@ -646,7 +663,7 @@ onUnmounted(() => {
               class="route-swatch"
               :style="{ background: r.routeColor || '#ccc' }"
             />
-            <span class="id">{{ r.id }}</span>
+            <span class="id id--utc" :title="String(r.id)">{{ routeIdUtc(r.id) }}</span>
             <span class="pill pill-live">live</span>
           </div>
           <span class="hops">{{ (r.hops_hex || []).join(" → ") }}</span>
@@ -776,7 +793,9 @@ onUnmounted(() => {
                 />
                 <div class="history-body">
                   <div class="history-top">
-                    <span class="id">{{ entry.id }}</span>
+                    <span class="id id--utc" :title="String(entry.id)">{{
+                      routeIdUtc(entry.id)
+                    }}</span>
                     <span class="history-time">{{ timeLabel(entry) }}</span>
                   </div>
                   <span class="hops mini">{{
@@ -1131,6 +1150,12 @@ h2 {
   color: #7dd3c0;
   font-variant-numeric: tabular-nums;
   font-size: 0.78rem;
+}
+.id--utc {
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  word-break: break-all;
 }
 .hops {
   word-break: break-all;
