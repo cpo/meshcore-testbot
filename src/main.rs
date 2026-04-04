@@ -8,6 +8,12 @@
 //! Set `MESHCORE_LOGALL` (any non-empty value) to log every companion packet **in and out** (hex dump and parsed summary on stderr).
 //! Channel message packets (`0x08` / `0x11`) are always printed on receive (same format), even when `MESHCORE_LOGALL` is unset.
 //!
+//! **Route visualizer:** `MESHCORE_VISOR_PORT` (default `3847`) starts an HTTP server + WebSocket (`/ws`) and serves the Vue
+//! build from `frontend/dist` (override with `MESHCORE_FRONTEND_DIST`). Contacten worden opgehaald van de MeshCore-kaart-API
+//! (`MESHCORE_MAP_NODES_URL`, default `https://map.meshcore.io/api/v1/nodes?binary=0&short=1`) na bootstrap en periodiek
+//! (`MESHCORE_CONTACT_SYNC_SECS`, default `300` = 5 min); paden worden afgeleid uit `0x88` RF-log + contactboek en naar
+//! clients gepusht.
+//!
 //! Replies are sent on the **same channel index** as the incoming message (among monitored `#bot` / `#bots` / `#test` slots).
 //! Trigger is the word `Test` (case-insensitive) alone, or after a MeshCore-style `name: ` prefix (e.g. `Alice: Test`); the reply appends that name when present.
 //! Optional: `MESHCORE_REPLY_TEXT` sets the location line in replies (default `Den Bosch Noord`); used for echo detection too.
@@ -20,12 +26,19 @@ use std::collections::HashSet;
 use std::env;
 use std::io::{Read, Write};
 use std::sync::mpsc::Sender as StdSender;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
+
+mod contact_book;
+mod geo_path;
+mod map_contacts;
+mod mesh_raw;
+mod visor;
 
 const FRAME_SEND_PREFIX: u8 = 0x3c; // '<'
 const FRAME_RECV_PREFIX: u8 = 0x3e; // '>'
@@ -99,6 +112,12 @@ pub trait MeshTransport: Send {
             }
         }
     }
+}
+
+fn is_bot_disabled() -> bool {
+    env::var("MESHCORE_BOT_DISABLED")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 /// 32-byte companion field is NUL-terminated then padded; only bytes before the first `0` are the name.
@@ -492,7 +511,8 @@ impl RxFramer {
             }
 
             self.expected = u16::from_le_bytes([self.header[1], self.header[2]]) as usize;
-            if self.expected > 300 {
+            // Companion-frames kunnen >300 bytes (o.a. uitgebreide device/contact payloads).
+            if self.expected > 2048 {
                 self.header.clear();
                 self.inframe.clear();
                 self.expected = 0;
@@ -707,6 +727,15 @@ fn poll_interval_secs() -> u64 {
         .unwrap_or(3)
 }
 
+/// Interval voor kaart-API-contactlijst (standaard 5 minuten).
+fn contact_resync_interval_secs() -> u64 {
+    env::var("MESHCORE_CONTACT_SYNC_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(300)
+}
+
 fn spawn_get_message_poll_std(write_tx: StdSender<Vec<u8>>) {
     let poll_secs = poll_interval_secs();
     eprintln!("GET_MESSAGE poll every {poll_secs}s");
@@ -739,6 +768,15 @@ fn spawn_get_message_poll_unbounded(write_tx: UnboundedSender<Vec<u8>>) {
     });
 }
 
+async fn sync_contacts(hub: &visor::VisorHub) -> Result<()> {
+    let records = map_contacts::fetch_map_contacts().await?;
+    let raw = records.len();
+    hub.bulk_replace_contacts(records);
+    let retrieved = hub.contact_count_deduped();
+    eprintln!("visor: map contact sync complete: {retrieved} contacts ({raw} rows from API)");
+    Ok(())
+}
+
 async fn handle_incoming_frame<T: MeshTransport + ?Sized>(
     companion: &mut T,
     monitored: &HashSet<u8>,
@@ -755,6 +793,9 @@ async fn handle_incoming_frame<T: MeshTransport + ?Sized>(
             let Some(msg) = parse_channel_message(frame) else {
                 return Ok(());
             };
+            if is_bot_disabled() {
+                return Ok(());
+            }
             if monitored.is_empty() || !monitored.contains(&msg.channel_idx) {
                 return Ok(());
             }
@@ -783,10 +824,12 @@ async fn handle_incoming_frame<T: MeshTransport + ?Sized>(
 async fn drain_pending_messages<T: MeshTransport + ?Sized>(
     companion: &mut T,
     monitored: &HashSet<u8>,
+    hub: &visor::VisorHub,
 ) -> Result<()> {
     for _ in 0..128 {
         companion.send_payload(GET_MESSAGE).await?;
         let pkt = companion.next_frame().await?;
+        hub.process_frame(&pkt);
         match pkt.first().copied() {
             Some(PKT_NO_MORE_MSGS) => return Ok(()),
             _ => handle_incoming_frame(companion, monitored, &pkt).await?,
@@ -796,9 +839,14 @@ async fn drain_pending_messages<T: MeshTransport + ?Sized>(
     Ok(())
 }
 
-async fn wait_for_packet<T: MeshTransport + ?Sized>(companion: &mut T, want: u8) -> Result<Vec<u8>> {
+async fn wait_for_packet<T: MeshTransport + ?Sized>(
+    companion: &mut T,
+    want: u8,
+    hub: &visor::VisorHub,
+) -> Result<Vec<u8>> {
     loop {
         let f = companion.next_frame().await?;
+        hub.process_frame(&f);
         if f.is_empty() {
             continue;
         }
@@ -811,12 +859,15 @@ async fn wait_for_packet<T: MeshTransport + ?Sized>(companion: &mut T, want: u8)
     }
 }
 
-async fn bootstrap<T: MeshTransport + ?Sized>(companion: &mut T) -> Result<HashSet<u8>> {
+async fn bootstrap<T: MeshTransport + ?Sized>(
+    companion: &mut T,
+    hub: &visor::VisorHub,
+) -> Result<HashSet<u8>> {
     companion.send_payload(APP_START).await?;
-    let _self_info = wait_for_packet(companion, PKT_SELF_INFO).await?;
+    let _self_info = wait_for_packet(companion, PKT_SELF_INFO, hub).await?;
 
     companion.send_payload(DEVICE_QUERY).await?;
-    let dev = wait_for_packet(companion, PKT_DEVICE_INFO).await?;
+    let dev = wait_for_packet(companion, PKT_DEVICE_INFO, hub).await?;
     let max_ch = parse_device_info_max_channels(&dev).unwrap_or(8);
 
     eprintln!(
@@ -830,6 +881,7 @@ async fn bootstrap<T: MeshTransport + ?Sized>(companion: &mut T) -> Result<HashS
         companion.send_payload(&get_channel_cmd(idx)).await?;
         loop {
             let pkt = companion.next_frame().await?;
+            hub.process_frame(&pkt);
             match pkt.first().copied() {
                 Some(PKT_CHANNEL_INFO) => {
                     if let Some((i, name, secret)) = parse_channel_info(&pkt) {
@@ -856,23 +908,60 @@ async fn bootstrap<T: MeshTransport + ?Sized>(companion: &mut T) -> Result<HashS
         );
     }
 
+    if let Err(e) = sync_contacts(hub).await {
+        eprintln!("warning: contact sync: {e}");
+    }
+
     Ok(monitored)
 }
 
-async fn run_bot_inner<T: MeshTransport>(transport: &mut T, transport_label: &str) -> Result<()> {
+async fn run_bot_inner<T: MeshTransport>(
+    transport: &mut T,
+    transport_label: &str,
+    hub: &visor::VisorHub,
+) -> Result<()> {
     eprintln!("{transport_label}");
-    let monitored = bootstrap(transport).await?;
-    drain_pending_messages(transport, &monitored).await?;
+    let monitored = bootstrap(transport, hub).await?;
+    drain_pending_messages(transport, &monitored, hub).await?;
+
+    let sync_secs = contact_resync_interval_secs();
+    eprintln!("map API contact resync every {sync_secs}s");
+    let mut contact_interval = tokio::time::interval(Duration::from_secs(sync_secs));
+    contact_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    contact_interval.tick().await;
+
     loop {
-        let frames = transport.read_frames().await?;
-        for frame in frames {
-            handle_incoming_frame(transport, &monitored, &frame).await?;
+        tokio::select! {
+            frames = transport.read_frames() => {
+                let frames = frames?;
+                for frame in frames {
+                    hub.process_frame(&frame);
+                    handle_incoming_frame(transport, &monitored, &frame).await?;
+                }
+            }
+            _ = contact_interval.tick() => {
+                if let Err(e) = sync_contacts(hub).await {
+                    eprintln!("warning: periodic contact sync: {e}");
+                }
+            }
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let hub = Arc::new(visor::VisorHub::new());
+    let visor_port: u16 = env::var("MESHCORE_VISOR_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3847);
+    let hub_server = hub.clone();
+    tokio::spawn(async move {
+        if let Err(e) = visor::run_server(hub_server, visor_port).await {
+            eprintln!("visor server: {e}");
+        }
+    });
+
     let tcp_addr = env::var("MESHCORE_TCP")
         .ok()
         .map(|s| s.trim().to_string())
@@ -887,6 +976,7 @@ async fn main() -> Result<()> {
                 "TCP {addr} — trigger: exact message in {:?}",
                 TRIGGER_TEXTS
             ),
+            &hub,
         )
         .await
     } else {
@@ -906,6 +996,7 @@ async fn main() -> Result<()> {
                 "USB serial {path} @ {baud} baud — trigger: exact message in {:?}",
                 TRIGGER_TEXTS
             ),
+            &hub,
         )
         .await
     }
