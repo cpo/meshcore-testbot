@@ -1,11 +1,15 @@
-//! Contacten uit de publieke MeshCore-kaart-API (`/api/v1/nodes`).
+//! Contacten uit de publieke MeshCore-kaart-API (`/api/v1/nodes`, o.a. `map.meshcore.io`).
+//!
+//! Rijen waarvan `updated_date` ouder is dan 14 dagen worden genegeerd (geen kaartindex).
+//! Ontbreekt het veld (oude cache-export), dan blijft de node staan.
 //!
 //! De ruwe JSON-response kan in een lokaal bestand worden gezet; bij opstart wordt dat
-//! gelezen i.p.v. opnieuw `map.meshcore.io` aan te roepen ([`MapLoadMode::PreferCache`]).
+//! gelezen i.p.v. opnieuw de API aan te roepen ([`MapLoadMode::PreferCache`]).
 //! Periodieke sync gebruikt het netwerk en ververst het bestand ([`MapLoadMode::NetworkRefresh`]).
 
 use crate::contact_book::ContactRecord;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -14,6 +18,8 @@ use tokio::fs;
 
 const DEFAULT_MAP_NODES_URL: &str = "https://map.meshcore.io/api/v1/nodes?binary=0&short=1";
 const DEFAULT_CACHE_FILENAME: &str = "meshcore_map_nodes_cache.json";
+/// Nodes met `updated_date` ouder dan dit worden niet op de kaart/contactindex gezet.
+const MAP_NODE_MAX_AGE: chrono::Duration = chrono::Duration::days(14);
 
 fn map_nodes_url() -> String {
     env::var("MESHCORE_MAP_NODES_URL")
@@ -53,6 +59,9 @@ struct MapNodeJson {
     adv_name: String,
     adv_lat: Option<f64>,
     adv_lon: Option<f64>,
+    /// RFC3339 van de kaart-API; ontbreekt in oude cache → node blijft meetellen.
+    #[serde(default)]
+    updated_date: Option<DateTime<Utc>>,
 }
 
 /// Hoe kaartdata wordt geladen.
@@ -97,8 +106,14 @@ fn contact_from_map_node(n: MapNodeJson) -> Option<ContactRecord> {
 }
 
 fn records_from_nodes(nodes: Vec<MapNodeJson>) -> Vec<ContactRecord> {
+    let cutoff = Utc::now() - MAP_NODE_MAX_AGE;
     let mut out = Vec::with_capacity(nodes.len());
     for n in nodes {
+        if let Some(ts) = n.updated_date {
+            if ts < cutoff {
+                continue;
+            }
+        }
         if let Some(c) = contact_from_map_node(n) {
             out.push(c);
         }

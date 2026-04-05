@@ -6,6 +6,7 @@ description = "MeshCore companion bot over USB serial or TCP"
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 hex = "0.4"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
