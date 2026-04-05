@@ -3,6 +3,9 @@
 use crate::contact_book::{parse_contact_packet, ContactBook, ContactRecord};
 use crate::geo_path::infer_route_lon_lat;
 use crate::mesh_raw::parse_mesh_path_hops_hex;
+use crate::protocol::{
+    PKT_CONTACT, PKT_CONTACT_END, PKT_CONTACT_START, PKT_LOG_RX_DATA, PKT_SELF_INFO, PUSH_NEW_ADVERT,
+};
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -18,16 +21,6 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
-
-/// Companion: `PACKET_CONTACT_START` / `PACKET_CONTACT` / `PACKET_CONTACT_END`.
-pub const PKT_CONTACT_START: u8 = 0x02;
-pub const PKT_CONTACT: u8 = 0x03;
-pub const PKT_CONTACT_END: u8 = 0x04;
-
-const PKT_SELF_INFO: u8 = 0x05;
-const PKT_LOG_RX_DATA: u8 = 0x88;
-/// Zelfde contactpayload als `PACKET_CONTACT` (`MyMesh::writeContactRespFrame`).
-const PUSH_NEW_ADVERT: u8 = 0x8a;
 
 #[derive(Clone)]
 pub struct VisorHub {

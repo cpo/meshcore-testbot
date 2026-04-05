@@ -16,7 +16,7 @@ defineProps({
       <div class="route-head">
         <span
           class="route-swatch"
-          :style="{ background: r.routeColor || '#ccc' }"
+          :style="{ background: r.routeColor || '#475569' }"
         />
         <span class="id id--utc" :title="String(r.id)">{{ routeIdUtc(r.id) }}</span>
         <span class="pill pill-live">live</span>

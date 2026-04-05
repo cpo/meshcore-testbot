@@ -52,8 +52,9 @@ function wsUrl() {
 
 function randomRouteColor() {
   const h = Math.random() * 360;
-  const s = 65 + Math.random() * 30;
-  const l = 42 + Math.random() * 16;
+  // Higher saturation, lower lightness so polylines stay readable on light basemaps.
+  const s = 72 + Math.random() * 24;
+  const l = 26 + Math.random() * 14;
   return `hsl(${h} ${s}% ${l}%)`;
 }
 
@@ -290,7 +291,7 @@ function toggleHistoryRoute(entry) {
   }
   const latlngs = entry.coords.map(([lat, lon]) => [lat, lon]);
   const poly = L.polyline(latlngs, {
-    color: entry.routeColor || "#94a3b8",
+    color: entry.routeColor || "#475569",
     weight: 5,
     opacity: 0.88,
     dashArray: "10 8",
