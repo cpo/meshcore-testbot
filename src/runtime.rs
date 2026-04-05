@@ -54,12 +54,15 @@ pub fn spawn_get_message_poll_unbounded(write_tx: UnboundedSender<Vec<u8>>) {
     });
 }
 
-async fn sync_contacts(hub: &crate::visor::VisorHub) -> Result<()> {
-    let records = map_contacts::fetch_map_contacts().await?;
+async fn sync_contacts(
+    hub: &crate::visor::VisorHub,
+    mode: map_contacts::MapLoadMode,
+) -> Result<()> {
+    let records = map_contacts::fetch_map_contacts(mode).await?;
     let raw = records.len();
     hub.bulk_replace_contacts(records);
     let retrieved = hub.contact_count_deduped();
-    eprintln!("visor: map contact sync complete: {retrieved} contacts ({raw} rows from API)");
+    eprintln!("visor: map contact sync complete: {retrieved} contacts ({raw} rows ingelezen)");
     Ok(())
 }
 
@@ -194,7 +197,7 @@ async fn bootstrap<T: MeshTransport + ?Sized>(
         );
     }
 
-    if let Err(e) = sync_contacts(hub).await {
+    if let Err(e) = sync_contacts(hub, map_contacts::MapLoadMode::PreferCache).await {
         eprintln!("warning: contact sync: {e}");
     }
 
@@ -226,7 +229,7 @@ pub async fn run_bot_inner<T: MeshTransport>(
                 }
             }
             _ = contact_interval.tick() => {
-                if let Err(e) = sync_contacts(hub).await {
+                if let Err(e) = sync_contacts(hub, map_contacts::MapLoadMode::NetworkRefresh).await {
                     eprintln!("warning: periodic contact sync: {e}");
                 }
             }

@@ -1,9 +1,6 @@
 # MeshCoreBot
 
-MeshCoreBot is a companion for MeshCore. It connects over **USB serial** or **TCP** using the same framing as MeshCore `ArduinoSerialInterface`:
-
-- **Send:** `<` + u16 LE length + payload  
-- **Receive:** `>` + u16 LE length + payload  
+MeshCoreBot is a companion for MeshCore. It connects over **USB serial** or **TCP** using the same framing as MeshCore `ArduinoSerialInterface`.
 
 It also runs an embedded **visor**: an HTTP server with a **Vue** frontend and **WebSocket** that shows RF routes live and infers paths from the RF log (`0x88`) plus contact and position data.
 

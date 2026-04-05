@@ -24,11 +24,17 @@ const mapEl = ref(null);
 let map;
 let ws;
 let contactLayerGroup;
+/** Rasterclusters van kaart-contacten (zonder live/geselecteerd pad). */
+let overviewLayerGroup;
+/** SVG-renderer voor clusters: met `preferCanvas` tonen tooltips op canvas-cirkels vaak niet. */
+let overviewClusterRenderer;
 let selfMarker;
 
 const routes = ref([]);
 const routeHistory = ref([]);
 const contactReportedTotal = ref(null);
+/** Kaart-index: `{ lat, lon, name }` per station met GPS; clustering in de browser per zoom. */
+const contactPoints = ref([]);
 const selfPos = ref(null);
 const status = ref("Verbinden…");
 const livePaused = ref(false);
@@ -40,6 +46,20 @@ const spoorboekjePage = ref(1);
 const routeLayers = new Map();
 const routeTimeouts = new Map();
 const historyRouteLayers = new Map();
+/** Top z-index pane for spoorboekje node hover ring */
+let hoverHighlightGroup;
+/** RAF coalescing for cluster redraw on pan/zoom */
+let clusterOverviewRaf = 0;
+
+/** Max. clusters na globale vergroving (alleen op gefilterde viewport-punten). */
+const MAX_CLUSTER_MARKERS = 320;
+/** Minimaal aantal clusters in beeld (fijner raster tot dit haalbaar is). */
+const MIN_CLUSTERS_TARGET = 40;
+/** Punten buiten dit kader om de viewport worden niet meegenomen bij clustering. */
+const CLUSTER_VIEW_PAD = 0.38;
+const ABS_MIN_CELL_DEG = 0.0025;
+/** Vanaf dit zoomniveau: geen clusters, alleen losse kaartposities in beeld. */
+const ZOOM_SHOW_INDIVIDUAL_NODES_FROM = 13;
 
 function wsUrl() {
   const explicit = import.meta.env.VITE_VISOR_WS_URL;
@@ -76,6 +96,42 @@ function fitMapToPolyline(latlngs) {
   }
 }
 
+function setHistoryNodeHover(payload) {
+  if (!map || !hoverHighlightGroup) {
+    return;
+  }
+  hoverHighlightGroup.clearLayers();
+  if (!payload?.entry || !payload?.node) {
+    return;
+  }
+  const { entry, node } = payload;
+  if (!selectedHistoryIds.value.includes(String(entry.id))) {
+    return;
+  }
+  const coords = entry.coords;
+  const i = Number(node.n) - 1;
+  if (!Array.isArray(coords) || i < 0 || i >= coords.length) {
+    return;
+  }
+  const pt = coords[i];
+  if (!Array.isArray(pt) || pt.length < 2) {
+    return;
+  }
+  const lat = Number(pt[0]);
+  const lon = Number(pt[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return;
+  }
+  L.circleMarker([lat, lon], {
+    pane: "hoverHighlight",
+    radius: 12,
+    color: "#f59e0b",
+    weight: 3,
+    fillColor: "#fcd34d",
+    fillOpacity: 0.95,
+  }).addTo(hoverHighlightGroup);
+}
+
 function fitAllVisibleRoutes() {
   if (!map) {
     return;
@@ -99,6 +155,14 @@ function fitAllVisibleRoutes() {
   }
   if (contactLayerGroup) {
     contactLayerGroup.eachLayer((layer) => {
+      const ll = layer.getLatLng?.();
+      if (ll) {
+        merge(L.latLngBounds(ll, ll));
+      }
+    });
+  }
+  if (overviewLayerGroup) {
+    overviewLayerGroup.eachLayer((layer) => {
       const ll = layer.getLatLng?.();
       if (ll) {
         merge(L.latLngBounds(ll, ll));
@@ -138,6 +202,185 @@ function updateSelfMarker(selfLatLon) {
   }
 }
 
+function hasRoutePathOnMap() {
+  if (
+    routes.value.some((r) => Array.isArray(r.coords) && r.coords.length > 0)
+  ) {
+    return true;
+  }
+  for (const hid of selectedHistoryIds.value) {
+    const entry = routeHistory.value.find((e) => String(e.id) === String(hid));
+    if (entry && Array.isArray(entry.coords) && entry.coords.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Celgrootte in °: verder inzoomen => fijner raster (kleinere cellen dan eerder voor meer detail). */
+function cellDegForZoom(zoom) {
+  const z = Math.min(16, Math.max(4, Number(zoom) || 8));
+  const deg = 0.5 * 2 ** (6 - z);
+  return Math.max(0.004, Math.min(1.12, deg));
+}
+
+function approxCellWidthKm(cellDeg) {
+  return Math.max(1, Math.round(cellDeg * 111));
+}
+
+/** Server: object `{ lat, lon, name }`; legacy: `[lat, lon]`. */
+function normalizeContactPoint(raw) {
+  if (raw == null) {
+    return null;
+  }
+  if (Array.isArray(raw) && raw.length >= 2) {
+    const lat = Number(raw[0]);
+    const lon = Number(raw[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return null;
+    }
+    return { lat, lon, name: "" };
+  }
+  if (typeof raw === "object") {
+    const lat = Number(raw.lat);
+    const lon = Number(raw.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return null;
+    }
+    const nm = raw.name != null ? String(raw.name).trim() : "";
+    return { lat, lon, name: nm };
+  }
+  return null;
+}
+
+function normalizeContactPointsList(arr) {
+  if (!Array.isArray(arr)) {
+    return [];
+  }
+  const out = [];
+  for (const raw of arr) {
+    const n = normalizeContactPoint(raw);
+    if (n) {
+      out.push(n);
+    }
+  }
+  return out;
+}
+
+function clusterContactPointsByCellDeg(points, cellDeg) {
+  if (!(cellDeg > 0) || !Number.isFinite(cellDeg)) {
+    return [];
+  }
+  const buckets = new Map();
+  for (const pt of points) {
+    const lat = Number(pt.lat);
+    const lon = Number(pt.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      continue;
+    }
+    const gx = Math.floor(lon / cellDeg);
+    const gy = Math.floor(lat / cellDeg);
+    const key = `${gx},${gy}`;
+    let b = buckets.get(key);
+    if (!b) {
+      b = { sumLat: 0, sumLon: 0, n: 0 };
+      buckets.set(key, b);
+    }
+    b.sumLat += lat;
+    b.sumLon += lon;
+    b.n += 1;
+  }
+  const out = [];
+  for (const b of buckets.values()) {
+    out.push({
+      lat: b.sumLat / b.n,
+      lon: b.sumLon / b.n,
+      count: b.n,
+    });
+  }
+  out.sort((a, b) => b.count - a.count);
+  return out;
+}
+
+function filterContactPointsToBounds(points, bounds) {
+  const out = [];
+  for (const pt of points) {
+    const lat = Number(pt.lat);
+    const lon = Number(pt.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      continue;
+    }
+    if (bounds.contains(L.latLng(lat, lon))) {
+      out.push(pt);
+    }
+  }
+  return out;
+}
+
+/**
+ * Cluster alleen punten in het zichtbare gebied (geen wereldwijde megacellen waarvan de centroid
+ * buiten NL valt). Daarna: max. MAX_CLUSTER_MARKERS, en minimaal MIN_CLUSTERS waar mogelijk.
+ */
+function clusterForMapOverview(localPoints, zoom) {
+  if (localPoints.length === 0) {
+    return { groups: [], cellDeg: cellDegForZoom(zoom) };
+  }
+  let cellDeg = cellDegForZoom(zoom);
+  let groups = clusterContactPointsByCellDeg(localPoints, cellDeg);
+  while (groups.length > MAX_CLUSTER_MARKERS && cellDeg < 5) {
+    cellDeg *= 1.28;
+    groups = clusterContactPointsByCellDeg(localPoints, cellDeg);
+  }
+  const minTarget = Math.min(MIN_CLUSTERS_TARGET, localPoints.length);
+  let guard = 0;
+  while (
+    groups.length < minTarget &&
+    cellDeg > ABS_MIN_CELL_DEG &&
+    groups.length < localPoints.length &&
+    guard < 30
+  ) {
+    const prevN = groups.length;
+    cellDeg *= 0.82;
+    groups = clusterContactPointsByCellDeg(localPoints, cellDeg);
+    if (groups.length === prevN) {
+      break;
+    }
+    guard += 1;
+  }
+  while (groups.length > MAX_CLUSTER_MARKERS && cellDeg < 5) {
+    cellDeg *= 1.28;
+    groups = clusterContactPointsByCellDeg(localPoints, cellDeg);
+  }
+  return { groups, cellDeg };
+}
+
+function scheduleClusterOverviewRedraw() {
+  if (!map || hasRoutePathOnMap()) {
+    return;
+  }
+  if (clusterOverviewRaf) {
+    cancelAnimationFrame(clusterOverviewRaf);
+  }
+  clusterOverviewRaf = requestAnimationFrame(() => {
+    clusterOverviewRaf = 0;
+    renderRouteStationMarkers();
+  });
+}
+
+function onMapViewChangeForClusters() {
+  scheduleClusterOverviewRedraw();
+}
+
+function getOverviewClusterRenderer() {
+  if (!map) {
+    return undefined;
+  }
+  if (!overviewClusterRenderer) {
+    overviewClusterRenderer = L.svg({ padding: 0.5 });
+  }
+  return overviewClusterRenderer;
+}
+
 function renderRouteStationMarkers() {
   if (!map) {
     return;
@@ -145,7 +388,90 @@ function renderRouteStationMarkers() {
   if (!contactLayerGroup) {
     contactLayerGroup = L.layerGroup().addTo(map);
   }
+  if (!overviewLayerGroup) {
+    overviewLayerGroup = L.layerGroup().addTo(map);
+  }
   contactLayerGroup.clearLayers();
+  overviewLayerGroup.clearLayers();
+
+  if (!hasRoutePathOnMap()) {
+    const points = contactPoints.value;
+    if (!Array.isArray(points) || points.length === 0) {
+      return;
+    }
+    const z = map.getZoom();
+    const viewBounds = map.getBounds().pad(CLUSTER_VIEW_PAD);
+    const localPoints = filterContactPointsToBounds(points, viewBounds);
+    const clusterRenderer = getOverviewClusterRenderer();
+
+    if (z >= ZOOM_SHOW_INDIVIDUAL_NODES_FROM) {
+      for (const pt of localPoints) {
+        const lat = Number(pt.lat);
+        const lon = Number(pt.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+          continue;
+        }
+        const coordLabel = `${lat.toFixed(4)}°, ${lon.toFixed(4)}°`;
+        const nm = pt.name != null ? String(pt.name).trim() : "";
+        const title = nm || "Kaart-index";
+        const tip = nm
+          ? `${escapeHtml(nm)} · ${escapeHtml(coordLabel)}`
+          : `Kaart-index · ${escapeHtml(coordLabel)}`;
+        L.circleMarker([lat, lon], {
+          ...(clusterRenderer ? { renderer: clusterRenderer } : {}),
+          radius: 5,
+          color: "#4f46e5",
+          weight: 2,
+          fillColor: "#a5b4fc",
+          fillOpacity: 0.88,
+        })
+          .bindTooltip(tip, {
+            direction: "top",
+            className: "contact-cluster-tooltip",
+          })
+          .bindPopup(
+            `<b>${escapeHtml(title)}</b><br><span class="popup-hop-hint">${escapeHtml(coordLabel)}</span>`,
+          )
+          .addTo(overviewLayerGroup);
+      }
+      return;
+    }
+
+    const { groups, cellDeg } = clusterForMapOverview(localPoints, z);
+    const kmHint = approxCellWidthKm(cellDeg);
+    for (const g of groups) {
+      const lat = Number(g.lat);
+      const lon = Number(g.lon);
+      const count = Number(g.count);
+      if (
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lon) ||
+        !Number.isFinite(count) ||
+        count < 1
+      ) {
+        continue;
+      }
+      const radius = 4 + Math.min(14, Math.sqrt(count) * 1.05);
+      const m = L.circleMarker([lat, lon], {
+        ...(clusterRenderer ? { renderer: clusterRenderer } : {}),
+        radius,
+        color: "#4f46e5",
+        weight: 2,
+        fillColor: "#818cf8",
+        fillOpacity: 0.55,
+      });
+      m.bindTooltip(String(count), {
+        permanent: true,
+        direction: "center",
+        className: "contact-cluster-count-label",
+      })
+        .bindPopup(
+          `${count} radio${count === 1 ? "" : "'s"} in dit cluster · raster ~${kmHint} km · zoom ${z}`,
+        )
+        .addTo(overviewLayerGroup);
+    }
+    return;
+  }
 
   function drawNodesForRoute(r) {
     const hops = Array.isArray(r.hops_hex) ? r.hops_hex : [];
@@ -388,8 +714,39 @@ watch(
   },
 );
 
+watch(
+  selectedHistoryIds,
+  () => {
+    hoverHighlightGroup?.clearLayers();
+  },
+  { deep: true },
+);
+
+watch(
+  [routes, selectedHistoryIds],
+  () => {
+    if (map) {
+      renderRouteStationMarkers();
+    }
+  },
+  { deep: true },
+);
+
+watch(contactPoints, () => {
+  if (map) {
+    renderRouteStationMarkers();
+  }
+});
+
 onMounted(async () => {
-  map = L.map(mapEl.value).setView([51.7, 5.3], 8);
+  map = L.map(mapEl.value, { preferCanvas: true }).setView([51.7, 5.3], 8);
+  map.createPane("hoverHighlight");
+  map.getPane("hoverHighlight").style.zIndex = 650;
+  map.getPane("hoverHighlight").style.pointerEvents = "none";
+  hoverHighlightGroup = L.layerGroup({ pane: "hoverHighlight" }).addTo(map);
+  map.on("zoomend", onMapViewChangeForClusters);
+  map.on("moveend", onMapViewChangeForClusters);
+
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "© OpenStreetMap-bijdragers",
     maxZoom: 19,
@@ -421,10 +778,9 @@ onMounted(async () => {
   ws.onmessage = (ev) => {
     try {
       const data = JSON.parse(ev.data);
-      if (livePaused.value) {
-        if (data.type === "contacts" || data.type === "route") {
-          return;
-        }
+      // Pauze: alleen live RF-routes blokkeren; contacten/clusters blijven updaten.
+      if (livePaused.value && data.type === "route") {
+        return;
       }
       if (data.type === "contacts") {
         selfPos.value = data.self_pos ?? null;
@@ -432,6 +788,7 @@ onMounted(async () => {
           data.reported_total != null && Number.isFinite(Number(data.reported_total))
             ? Number(data.reported_total)
             : null;
+        contactPoints.value = normalizeContactPointsList(data.contact_points);
         renderSelfAndRoutes(selfPos.value);
         return;
       }
@@ -451,8 +808,17 @@ onUnmounted(() => {
   }
   routes.value = [];
   clearAllHistoryOverlays();
-  ws?.close();
+  hoverHighlightGroup?.clearLayers();
+  if (clusterOverviewRaf) {
+    cancelAnimationFrame(clusterOverviewRaf);
+    clusterOverviewRaf = 0;
+  }
+  map?.off("zoomend", onMapViewChangeForClusters);
+  map?.off("moveend", onMapViewChangeForClusters);
   map?.remove();
+  hoverHighlightGroup = undefined;
+  overviewClusterRenderer = undefined;
+  ws?.close();
 });
 </script>
 
@@ -483,6 +849,7 @@ onUnmounted(() => {
         @prev-page="spoorboekjePrev"
         @next-page="spoorboekjeNext"
         @toggle-history="toggleHistoryRoute"
+        @history-node-hover="setHistoryNodeHover"
       />
 
       <ContactsPanel
@@ -542,5 +909,32 @@ body {
   margin-top: 0.35rem;
   font-size: 0.72rem;
   color: #7a8699;
+}
+
+.leaflet-tooltip.contact-cluster-tooltip {
+  background: rgba(15, 17, 24, 0.9);
+  color: #c7d2fe;
+  border: 1px solid rgba(129, 140, 248, 0.45);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  max-width: 220px;
+  white-space: normal;
+}
+
+.leaflet-tooltip.contact-cluster-count-label {
+  background: rgba(30, 27, 46, 0.88);
+  color: #eef2ff;
+  border: 1px solid rgba(199, 210, 254, 0.35);
+  border-radius: 999px;
+  padding: 1px 5px;
+  font-size: 0.62rem;
+  font-weight: 800;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.28);
+  margin: 0 !important;
 }
 </style>

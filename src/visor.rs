@@ -1,6 +1,8 @@
 //! HTTP + WebSocket voor route-visualisatie; statische Vue-build uit `frontend/dist`.
 
-use crate::contact_book::{parse_contact_packet, ContactBook, ContactRecord};
+use crate::contact_book::{
+    parse_contact_packet, ContactBook, ContactMapPoint, ContactRecord,
+};
 use crate::geo_path::infer_route_lon_lat;
 use crate::mesh_raw::parse_mesh_path_hops_hex;
 use crate::protocol::{
@@ -60,7 +62,8 @@ impl VisorHub {
         }
     }
 
-    /// JSON voor `type: contacts` (init + updates): geen volledige contactenlijst — alleen indexgrootte + eigen positie.
+    /// JSON voor `type: contacts` (init + updates): indexgrootte, eigen positie, en `contact_points`
+    /// (`lat`, `lon`, `name` per station met GPS) voor clustering en zoom ≥13 losse markers.
     pub fn contacts_snapshot_json(&self) -> Option<String> {
         let self_pos = self.self_pos.lock().ok().and_then(|p| {
             let (lo, la) = *p;
@@ -74,10 +77,17 @@ impl VisorHub {
             .lock()
             .ok()
             .and_then(|g| *g);
+        let contact_points: Vec<ContactMapPoint> = self
+            .contacts
+            .lock()
+            .ok()
+            .map(|g| g.deduped_contact_points_for_map())
+            .unwrap_or_default();
         let msg = ContactsWsMsg {
             msg_type: "contacts",
             self_pos,
             reported_total,
+            contact_points,
         };
         serde_json::to_string(&msg).ok()
     }
@@ -236,6 +246,9 @@ struct ContactsWsMsg {
     /// Aantal stations in de server-side index (kaart-API); geen lijst in dit bericht.
     #[serde(skip_serializing_if = "Option::is_none")]
     reported_total: Option<u32>,
+    /// Dedupeerde kaartposities met naam voor client-side clustering en detailzoom.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    contact_points: Vec<ContactMapPoint>,
 }
 
 #[derive(Serialize)]

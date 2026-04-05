@@ -32,8 +32,7 @@ defineEmits(["toggle-pause"]);
       {{ livePaused ? "Hervat live updates" : "Pauzeer live updates" }}
     </button>
     <p v-if="livePaused" class="pause-hint">
-      Nieuwe paden en index-/positie-updates worden niet verwerkt (bestaande
-      timers lopen door).
+      Nieuwe paden en index-/positie-updates worden niet verwerkt.
     </p>
   </div>
   <p class="hint">

@@ -15,6 +15,24 @@ const NAME_FIELD_LEN: usize = 32;
 /// Byte-index eerste byte van `gps_lat` (inclusief leading 0x03).
 const OFF_CONTACT_GPS_LAT: usize = 1 + PUB_KEY_SIZE + 3 + MAX_PATH_SIZE + NAME_FIELD_LEN + 4;
 
+/// Samenvatting voor de kaart: stations met GPS gegroepeerd in een vast raster (graden).
+/// Alleen nog gebruikt in tests; de visor stuurt losse punten naar de frontend.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Serialize)]
+pub struct ContactGeoGroup {
+    pub lat: f64,
+    pub lon: f64,
+    pub count: u32,
+}
+
+/// Kaartpunt voor de visor-WebSocket (clustering en losse markers).
+#[derive(Clone, Debug, Serialize)]
+pub struct ContactMapPoint {
+    pub lat: f64,
+    pub lon: f64,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ContactRecord {
     /// Eerste byte van de publieke sleutel (node-hash prefix).
@@ -176,6 +194,58 @@ impl ContactBook {
         m.into_values().collect()
     }
 
+    /// Dedupeerde kaartposities met GPS voor de visor (`lat`, `lon`, `name`; lege naam → pubkey-prefix).
+    pub fn deduped_contact_points_for_map(&self) -> Vec<ContactMapPoint> {
+        self.all_contacts_deduped()
+            .into_iter()
+            .filter_map(|c| {
+                let (Some(lat), Some(lon)) = (c.lat, c.lon) else {
+                    return None;
+                };
+                let trimmed = c.name.trim();
+                let name = if trimmed.is_empty() {
+                    c.pubkey_prefix_hex.clone()
+                } else {
+                    trimmed.to_string()
+                };
+                Some(ContactMapPoint { lat, lon, name })
+            })
+            .collect()
+    }
+
+    /// Groepeert dedupeerde contacten met GPS in rastercellen van `cell_deg` (breedte/hoogte in °).
+    #[allow(dead_code)]
+    pub fn geo_groups_by_deg(&self, cell_deg: f64) -> Vec<ContactGeoGroup> {
+        if !(cell_deg > 0.0 && cell_deg.is_finite()) {
+            return vec![];
+        }
+        let mut buckets: HashMap<(i64, i64), (f64, f64, u32)> = HashMap::new();
+        for c in self.all_contacts_deduped() {
+            let (Some(lat), Some(lon)) = (c.lat, c.lon) else {
+                continue;
+            };
+            let gx = (lon / cell_deg).floor() as i64;
+            let gy = (lat / cell_deg).floor() as i64;
+            let e = buckets.entry((gx, gy)).or_insert((0.0, 0.0, 0));
+            e.0 += lat;
+            e.1 += lon;
+            e.2 += 1;
+        }
+        let mut out: Vec<ContactGeoGroup> = buckets
+            .into_values()
+            .map(|(sum_lat, sum_lon, n)| {
+                let nf = f64::from(n);
+                ContactGeoGroup {
+                    lat: sum_lat / nf,
+                    lon: sum_lon / nf,
+                    count: n,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.count.cmp(&a.count));
+        out
+    }
+
 }
 
 #[cfg(test)]
@@ -222,5 +292,27 @@ mod tests {
             .contact_for_inferred_point("ab", (5.0, 52.01))
             .expect("nearest");
         assert_eq!(c.name, "Near");
+    }
+
+    #[test]
+    fn geo_groups_merge_same_cell() {
+        let mut book = ContactBook::default();
+        book.upsert(ContactRecord {
+            hash0: 0x01,
+            pubkey_prefix_hex: "aa11111111111111".into(),
+            name: "A".into(),
+            lat: Some(52.0),
+            lon: Some(5.0),
+        });
+        book.upsert(ContactRecord {
+            hash0: 0x02,
+            pubkey_prefix_hex: "bb22222222222222".into(),
+            name: "B".into(),
+            lat: Some(52.05),
+            lon: Some(5.05),
+        });
+        let g = book.geo_groups_by_deg(1.0);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].count, 2);
     }
 }

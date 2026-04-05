@@ -46,5 +46,5 @@ pub fn contact_resync_interval_secs() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&s| s > 0)
-        .unwrap_or(300)
+        .unwrap_or(300_000)
 }
