@@ -21,6 +21,7 @@ defineEmits([
   "prev-page",
   "next-page",
   "toggle-history",
+  "history-node-hover",
 ]);
 
 const { timeLabel } = useRelativeTime();
@@ -152,10 +153,12 @@ function isSelected(id) {
               <ol
                 v-if="routeHopNodes(entry).length"
                 class="route-nodes route-nodes--compact"
+                @mouseleave="$emit('history-node-hover', null)"
               >
                 <li
                   v-for="node in routeHopNodes(entry)"
                   :key="`${entry.id}-hop-${node.n}-${entry.archivedAt}`"
+                  @mouseenter="$emit('history-node-hover', { entry, node })"
                 >
                   <span class="route-node-badge" aria-hidden="true">{{
                     node.n
