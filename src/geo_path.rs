@@ -1,9 +1,10 @@
 //! Bepaalt het geografische pad op basis van contacten.
 //!
-//! Als **eigen positie** (`self_pos`, lon/lat) bekend is: het pad wordt **vanaf de lokale radio**
-//! opgebouwd door de hop-rij **achterwaarts** te doorlopen — per hop de contact-GPS die het
-//! **dichtst bij het vorige punt** ligt (eerst het dichtst bij jezelf, dan het dichtst bij het
-//! zo gevonden punt, enz.). De uitvoer blijft in **packet-volgorde** (`coords[i]` bij `hops[i]`).
+//! Als **eigen positie** (`self_pos`, lon/lat) bekend is: het pad gebruikt **Viterbi** op lagen in
+//! **omgekeerde hopvolgorde** (laatste hop eerst, geankerd bij de ontvanger): minimale som van
+//! segmentafstanden onder [`MAX_DIRECT_HOP_KM`], i.p.v. gulzig achteruit per hop. Uitvoer blijft in
+//! **packet-volgorde** (`coords[i]` bij `hops[i]`). (Bochtstraf op route is mogelijke toekomstige
+//! uitbreiding; nu alleen afstand.)
 //!
 //! Zonder eigen positie: valt terug op de eerdere voorwaartse inferentie (DP + relaxed synthese).
 //!
@@ -96,7 +97,7 @@ fn synth_step(prev: (f64, f64), hop_index: usize, b: u8) -> (f64, f64) {
     )
 }
 
-/// Strikt **achterwaarts vanaf eigen positie**: elke hop moet minstens één GPS-kandidaat hebben.
+/// Strikt vanaf eigen positie: Viterbi op lagen `[hops[n-1], …, hops[0]]` geankerd bij `self_lon_lat`.
 fn infer_route_lon_lat_reverse_from_self_strict(
     hops_hex: &[String],
     book: &ContactBook,
@@ -105,22 +106,21 @@ fn infer_route_lon_lat_reverse_from_self_strict(
     if hops_hex.is_empty() {
         return vec![];
     }
-    let mut prev = self_lon_lat;
-    let mut rev: Vec<(f64, f64)> = Vec::with_capacity(hops_hex.len());
+    let mut gps_rows_rev: Vec<Vec<(f64, f64)>> = Vec::with_capacity(hops_hex.len());
     for hop_hex in hops_hex.iter().rev() {
         let gps = gps_points_for_hop(book, hop_hex);
         if gps.is_empty() {
             return vec![];
         }
-        let Some(p) = nearest_gps_within_km(prev, &gps, MAX_DIRECT_HOP_KM) else {
-            return vec![];
-        };
-        rev.push(p);
-        prev = p;
+        gps_rows_rev.push(gps);
     }
-    rev.reverse();
-    spread_degenerate_coords(&mut rev);
-    rev
+    let mut out = dp_segment(&gps_rows_rev, None, self_lon_lat, true);
+    if out.is_empty() {
+        return vec![];
+    }
+    out.reverse();
+    spread_degenerate_coords(&mut out);
+    out
 }
 
 /// Relaxed achterwaarts vanaf eigen positie: synthese als een hop geen GPS heeft.
@@ -199,8 +199,8 @@ fn infer_route_lon_lat_relaxed(hops_hex: &[String], book: &ContactBook) -> Vec<(
 /// `hops_hex`: per hop hex-prefix uit het RF-pad (1–4 bytes → 2–8 hextekens), te matchen met het begin
 /// van `ContactRecord::pubkey_prefix_hex`. Eén `(lon, lat)` per hop in packet-volgorde.
 ///
-/// `self_pos`: `(lon, lat)` van de lokale radio (advert). Als gezet: **achterwaarts** dichtstbijzijnde
-/// keten vanaf dit punt. Anders: voorwaartse fallback (DP + relaxed).
+/// `self_pos`: `(lon, lat)` van de lokale radio (advert). Als gezet: Viterbi vanaf ontvanger op
+/// omgekeerde hopvolgorde. Anders: voorwaartse fallback (DP + relaxed).
 pub fn infer_route_lon_lat(
     hops_hex: &[String],
     book: &ContactBook,
@@ -221,6 +221,7 @@ pub fn infer_route_lon_lat(
 }
 
 /// Viterbi op een doorlopende GPS-segment: minimaliseert som van segmentafstanden.
+/// (Een optionele bocht-/bearing-straf zou tweede-orde state in de DP vereisen; nu niet geïmplementeerd.)
 fn dp_segment(
     gps_rows: &[Vec<(f64, f64)>],
     prev_before_seg: Option<(f64, f64)>,
@@ -447,6 +448,73 @@ mod tests {
         let v = infer_route_lon_lat(&hops, &book, Some(self_pos));
         assert_eq!(v.len(), 2);
         assert!(infer_route_lon_lat_strict(&hops, &book).is_empty());
+    }
+
+    /// Oude gulzige achterwaartse keten (strikt): alleen voor regressie tegen Viterbi.
+    fn greedy_reverse_strict_old(
+        hops_hex: &[String],
+        book: &ContactBook,
+        self_lon_lat: (f64, f64),
+    ) -> Vec<(f64, f64)> {
+        if hops_hex.is_empty() {
+            return vec![];
+        }
+        let mut prev = self_lon_lat;
+        let mut rev: Vec<(f64, f64)> = Vec::with_capacity(hops_hex.len());
+        for hop_hex in hops_hex.iter().rev() {
+            let gps = gps_points_for_hop(book, hop_hex);
+            if gps.is_empty() {
+                return vec![];
+            }
+            let Some(p) = nearest_gps_within_km(prev, &gps, MAX_DIRECT_HOP_KM) else {
+                return vec![];
+            };
+            rev.push(p);
+            prev = p;
+        }
+        rev.reverse();
+        rev
+    }
+
+    #[test]
+    fn viterbi_finds_chain_when_greedy_last_hop_would_fail() {
+        // self (5, 52); laatste hop "cd" heeft C_near bij self en C_far iets verder; eerste hop "ab"
+        // heeft alleen A. Alleen C_far–A is ≤60 km; C_near–A > 60 km. Gulzig kiest laatste hop
+        // C_near → geen geldige A → leeg. Viterbi kiest C_far en A.
+        let mut book = ContactBook::default();
+        book.upsert(ContactRecord {
+            hash0: 0xab,
+            pubkey_prefix_hex: "ab0001".into(),
+            name: "A".into(),
+            lat: Some(52.56),
+            lon: Some(5.0),
+        });
+        book.upsert(ContactRecord {
+            hash0: 0xcd,
+            pubkey_prefix_hex: "cd0001".into(),
+            name: "C_near".into(),
+            lat: Some(52.01),
+            lon: Some(5.01),
+        });
+        book.upsert(ContactRecord {
+            hash0: 0xcd,
+            pubkey_prefix_hex: "cd0002".into(),
+            name: "C_far".into(),
+            lat: Some(52.08),
+            lon: Some(5.15),
+        });
+        let hops = vec!["ab".into(), "cd".into()];
+        let self_pos = (5.0_f64, 52.0_f64);
+        assert!(
+            greedy_reverse_strict_old(&hops, &book, self_pos).is_empty(),
+            "greedy should pick C_near for last hop then fail to reach A"
+        );
+        let v = infer_route_lon_lat(&hops, &book, Some(self_pos));
+        assert_eq!(v.len(), 2);
+        let dist_ab_to_a = haversine_km(v[0], (5.0, 52.56));
+        assert!(dist_ab_to_a < 1.0, "first hop should be A");
+        let dist_cd_to_far = haversine_km(v[1], (5.15, 52.08));
+        assert!(dist_cd_to_far < 1.0, "second hop should be C_far");
     }
 
     #[test]
