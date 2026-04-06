@@ -136,6 +136,14 @@ cargo build --release
 
 Binary: `target/release/meshcorebot`.
 
+## Disclaimer (mostly silicon, lightly supervised)
+
+For the most part, this software was **not** written by a single human in a cabin with a thermos of coffee—it was **generated with AI assistance**, the way one might ask a very fast intern who has read the entire internet and still occasionally proposes `sudo rm -rf` as a debugging step.
+
+**A professional developer has reviewed the code and deemed it “sane enough”** to exist in public: logic checked, sharp edges filed down, and the worst ideas politely declined. That bar is deliberately modest—think “won’t set your mesh on fire by default,” not “formally verified while you sleep.”
+
+If something misbehaves, blame the radio, the ionosphere, or cosmic rays first; then file an issue.
+
 ## License
 
 This project is licensed under the GNU Lesser General Public License (LGPL) v3.0 or later.
